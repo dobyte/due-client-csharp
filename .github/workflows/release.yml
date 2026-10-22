@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '发布标签（例如 v1.0.0）；不存在时会基于当前提交创建'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate release tag
+        run: |
+          set -euo pipefail
+
+          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9] ]]; then
+            echo "release tag must start with v and a version number, got: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore and build
+        run: |
+          set -euo pipefail
+
+          dotnet restore due-client-csharp.sln
+          dotnet build due-client-csharp.sln -c Release --no-restore
+
+      - name: Verify package layout
+        run: |
+          set -euo pipefail
+
+          test -f due-client-csharp.csproj
+          test -f due-client-csharp.sln
+          test -f Client.cs
+          test -f Packer.cs
+          test -d encoding
+          test -d network
+          test -d security
+          test -f README.md
+
+      - name: Package C# SDK
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+
+          archive="dist/due-client-csharp-${RELEASE_TAG}.zip"
+
+          # 解压后可直接通过 dotnet build 使用
+          zip -r "${archive}" \
+            Client.cs Packer.cs ByteBuffer.cs Program.cs \
+            encoding network security \
+            due-client-csharp.csproj due-client-csharp.sln \
+            README.md .gitignore
+
+          unzip -l "${archive}"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          archive="dist/due-client-csharp-${RELEASE_TAG}.zip"
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" "${archive}" --clobber
+          else
+            gh release create "${RELEASE_TAG}" \
+              --title "${RELEASE_TAG}" \
+              --generate-notes \
+              "${archive}"
+          fi
