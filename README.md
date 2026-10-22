@@ -24,6 +24,7 @@ due是一款基于Go语言开发的轻量级、高性能分布式游戏服务器
 * 心跳：内置心跳保活，支持接收服务器心跳附带的服务器时间。
 * 网络：网络层接口化设计（INetwork），内置 tcp（Tcp）与 ws（Ws）两种实现。
 * 打包：打包器（Packer）支持自定义字节序、路由字节数、序列号字节数、消息体上限。
+* 安全：支持 due 会话安全（security），握手协商会话密钥并对业务消息加解密。
 
 ### 4.安装
 
@@ -122,6 +123,55 @@ client.Connect("127.0.0.1:3553");
 Client client = new Client(new Due.Network.Ws(packer), packer);
 client.Connect("ws://127.0.0.1:3553");
 ```
+
+### 8.会话安全（security）
+
+due 支持会话安全：客户端与服务端先完成握手，协商出双向 AEAD 会话密钥，之后所有业务消息的 payload 都会被加密，路由与序列号通过 AAD 绑定，防止篡改。
+
+服务端启用会话安全（需配置签名私钥，客户端使用对应公钥验签）：
+
+```go
+gate := gate.NewGate(
+    gate.WithServer(tcp.NewServer()),
+    gate.WithSessionSecurity(ecc.NewSigner(ecc.WithSignerPrivateKey("keys/gate.pem"))),
+)
+```
+
+C# 客户端启用会话安全：
+
+```csharp
+using Due;
+using Due.Security;
+
+Packer packer = new Packer();
+
+SecurityOptions security = new SecurityOptions
+{
+    // 服务端公钥：可以是 PEM 文件路径，也可以是 PEM 内容
+    Verifier = Verifier.Ecdsa("keys/gate.pub.pem"),
+    // 握手超时时间（毫秒），默认为 5000
+    HandshakeTimeout = 5000,
+};
+
+Client client = new Client(new Due.Network.Ws(packer), packer, security);
+
+client.OnConnect(c =>
+{
+    // 握手完成后才会触发 OnConnect，此时可以正常收发消息
+    c.Send(1, 1, new { message = "hello server" });
+});
+
+client.Connect("ws://127.0.0.1:3553");
+```
+
+> 注意：
+> * 握手使用 X25519 协商临时密钥，通过 HKDF-SHA256 派生双向密钥；客户端会用配置的公钥校验服务端 ServerHello 签名。
+> * 内置 AEAD 套件为 AES-256-GCM（套件编号 1，纯托管实现，不依赖运行时的 `AesGcm`）；客户端默认只提供该套件，需要与服务端启用的套件有交集。
+> * 只有握手成功后才会触发 `OnConnect`；握手完成前调用 `Send` 会返回 `false`。心跳帧保持明文，不参与会话加密。
+> * 每条连接都会重新握手，重连无需额外处理；握手失败、握手超时或业务帧认证失败都会主动断开连接。
+> * 服务端使用 RSA 签名时，改用 `Verifier.Rsa("keys/gate.pub.pem")`（默认 PSS 填充，如需 PKCS#1 v1.5 传入 `pss: false`）。
+> * 如需自定义验签逻辑（例如使用 HMAC 测试签名），可直接传入 `HandshakeVerifier` 委托；如需扩展 AEAD 算法，可实现 `IAeadSuite` 并通过 `SecurityOptions.Suites` 注入。
+> * 签名算法默认 SHA-256，需与服务端 `etc.crypto.ecc.signer.hash` 配置一致；ECDSA 签名的分隔符默认为空格，与服务端 `etc.crypto.ecc.signer.delimiter` 配置一致。
 
 ## License
 

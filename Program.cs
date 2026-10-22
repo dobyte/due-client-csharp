@@ -18,6 +18,13 @@ class Hello
         // 创建客户端：WebSocket 传输
         Client client = new(new Due.Network.Ws(packer), packer);
 
+        // 会话安全（可选）：服务端启用 security 时，需提供服务端公钥用于验签
+        // SecurityOptions security = new SecurityOptions
+        // {
+        //     Verifier = Due.Security.Verifier.Ecdsa("keys/gate.pub.pem"),
+        // };
+        // Client client = new(new Due.Network.Ws(packer), packer, security);
+
         // 监听连接
         client.OnConnect(ConnectHandler);
 

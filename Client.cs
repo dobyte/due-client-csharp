@@ -3,6 +3,7 @@ namespace Due;
 using System;
 using System.Timers;
 using Due.Network;
+using Due.Security;
 
 // 连接处理器
 public delegate void ConnectHandler(Client client);
@@ -25,11 +26,19 @@ public class Client
     // 网络层
     private INetwork Network { get; set; }
     // 打包器
-    private Packer Packer = new Packer();
+    private Packer Packer { get; set; }
     // 定时器
     private Timer? Timer;
     // 心跳包
     private byte[]? HeartbeatBuffer;
+    // 会话安全配置；为 null 时不启用会话安全
+    private readonly SecurityOptions? securityOptions;
+    // 握手状态
+    private HandshakeClient? handshake;
+    // 会话密钥
+    private volatile Session? session;
+    // 握手超时定时器
+    private System.Threading.Timer? handshakeTimer;
     // 连接处理器
     private ConnectHandler? ConnectHandler;
     // 断开连接处理器
@@ -63,34 +72,41 @@ public class Client
     {
     }
 
+    public Client(string addr, Packer packer, SecurityOptions securityOptions) : this(addr, new Tcp(packer), packer, securityOptions, DEFAULT_HEARTBEAT_INTERVAL)
+    {
+    }
+
     public Client(INetwork network, Packer packer) : this(network, packer, DEFAULT_HEARTBEAT_INTERVAL)
     {
     }
 
-    public Client(INetwork network, Packer packer, int heartbeatInterval)
+    public Client(INetwork network, Packer packer, int heartbeatInterval) : this(network, packer, null, heartbeatInterval)
     {
-        this.Network = network;
-        this.Packer = packer;
-
-        if (heartbeatInterval > 0)
-        {
-            this.Timer = new Timer(heartbeatInterval);
-            this.Timer.Elapsed += OnTimedEvent;
-            this.HeartbeatBuffer = this.Packer.PackHeartbeat();
-        }
-        else
-        {
-            this.Timer = null;
-        }
-
-        this.BindNetworkEvents();
     }
 
-    public Client(string addr, INetwork network, Packer packer, int heartbeatInterval)
+    public Client(INetwork network, Packer packer, SecurityOptions securityOptions) : this(network, packer, securityOptions, DEFAULT_HEARTBEAT_INTERVAL)
     {
+    }
+
+    public Client(INetwork network, Packer packer, SecurityOptions? securityOptions, int heartbeatInterval) : this(null, network, packer, securityOptions, heartbeatInterval)
+    {
+    }
+
+    public Client(string addr, INetwork network, Packer packer, int heartbeatInterval) : this(addr, network, packer, null, heartbeatInterval)
+    {
+    }
+
+    public Client(string? addr, INetwork network, Packer packer, SecurityOptions? securityOptions, int heartbeatInterval)
+    {
+        if (securityOptions != null && securityOptions.Verifier == null)
+        {
+            throw new ArgumentException("The verifier of the security options must not be null", nameof(securityOptions));
+        }
+
         this.Addr = addr;
         this.Network = network;
         this.Packer = packer;
+        this.securityOptions = securityOptions;
 
         if (heartbeatInterval > 0)
         {
@@ -111,18 +127,25 @@ public class Client
     {
         this.Network.OnConnected = () =>
         {
-            this.Heartbeat();
-            this.Timer?.Start();
+            this.ResetSecurityState();
 
-            if (this.ConnectHandler != null)
+            if (this.securityOptions != null)
             {
-                this.ConnectHandler(this);
+                this.StartHandshake();
+            }
+            else
+            {
+                this.OnEstablished();
             }
         };
 
         this.Network.OnDisconnected = () =>
         {
             this.Timer?.Stop();
+
+            this.StopHandshakeTimer();
+
+            this.ResetSecurityState();
 
             if (this.DisconnectHandler != null)
             {
@@ -134,20 +157,49 @@ public class Client
         {
             try
             {
-                Packet packet = this.Packer.Unpack(buff);
+                Frame frame = this.Packer.UnpackFrame(buff);
 
-                if (packet.IsHeartbeat)
+                if (frame.IsHeartbeat)
                 {
                     if (this.HeartbeatHandler != null)
                     {
-                        this.HeartbeatHandler(this, packet.Millisecond);
+                        this.HeartbeatHandler(this, frame.Millisecond);
                     }
+                }
+                else if (frame.IsHandshake)
+                {
+                    this.HandleHandshake(frame.Payload!);
                 }
                 else
                 {
-                    if (this.ReceiveHandler != null && packet.Message != null)
+                    byte[] payload = frame.Payload!;
+
+                    if (this.securityOptions != null)
                     {
-                        this.ReceiveHandler(this, (Message)packet.Message);
+                        Session? current = this.session;
+
+                        if (current == null)
+                        {
+                            Console.WriteLine("The security session is not established");
+                            return;
+                        }
+
+                        try
+                        {
+                            payload = current.OpenMessage(payload, Direction.ServerToClient, frame.Route, frame.Seq);
+                        }
+                        catch (Exception e)
+                        {
+                            // 认证失败或重放：连接已不可信，直接断开
+                            Console.WriteLine(e);
+                            this.Network.Disconnect();
+                            return;
+                        }
+                    }
+
+                    if (this.ReceiveHandler != null)
+                    {
+                        this.ReceiveHandler(this, new Message(frame.Seq, frame.Route, this.Packer.Decode(payload)));
                     }
                 }
             }
@@ -156,6 +208,128 @@ public class Client
                 Console.WriteLine(e);
             }
         };
+    }
+
+    // 连接就绪：启动心跳并触发连接回调；安全模式下在握手完成后调用
+    private void OnEstablished()
+    {
+        this.Heartbeat();
+        this.Timer?.Start();
+
+        if (this.ConnectHandler != null)
+        {
+            this.ConnectHandler(this);
+        }
+    }
+
+    // 发起会话安全握手
+    private void StartHandshake()
+    {
+        try
+        {
+            SecurityOptions options = this.securityOptions!;
+
+            this.handshake = new HandshakeClient(options.Verifier!, options.Suites);
+
+            byte[] hello = this.handshake.Hello();
+
+            this.StartHandshakeTimer();
+
+            if (!this.Network.Send(this.Packer.PackHandshake(hello)))
+            {
+                throw new Exception("Send client hello failed");
+            }
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine(e);
+            this.Network.Disconnect();
+        }
+    }
+
+    // 处理服务端握手帧
+    private void HandleHandshake(byte[] payload)
+    {
+        HandshakeClient? current = this.handshake;
+
+        if (current == null)
+        {
+            Console.WriteLine("Unexpected handshake frame");
+            return;
+        }
+
+        try
+        {
+            Session established = current.Handle(payload, out byte[] finished);
+
+            // 先发布会话，再回发 Finished：服务端确认后可能立即下发加密消息
+            this.session = established;
+
+            this.handshake = null;
+            this.StopHandshakeTimer();
+
+            if (!this.Network.Send(this.Packer.PackHandshake(finished)))
+            {
+                throw new Exception("Send finished frame failed");
+            }
+
+            this.OnEstablished();
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine(e);
+            this.Network.Disconnect();
+        }
+    }
+
+    // 启动握手超时定时器
+    private void StartHandshakeTimer()
+    {
+        int timeout = this.securityOptions!.HandshakeTimeout;
+
+        if (timeout <= 0)
+        {
+            return;
+        }
+
+        this.StopHandshakeTimer();
+        this.handshakeTimer = new System.Threading.Timer(this.HandleHandshakeTimeout, null, timeout, System.Threading.Timeout.Infinite);
+    }
+
+    // 停止握手超时定时器
+    private void StopHandshakeTimer()
+    {
+        System.Threading.Timer? timer = this.handshakeTimer;
+
+        if (timer == null)
+        {
+            return;
+        }
+
+        this.handshakeTimer = null;
+        timer.Dispose();
+    }
+
+    // 握手超时：断开连接
+    private void HandleHandshakeTimeout(object? state)
+    {
+        if (this.session != null)
+        {
+            return;
+        }
+
+        Console.WriteLine("The security handshake timed out");
+        this.Network.Disconnect();
+    }
+
+    // 清理握手状态与会话密钥
+    private void ResetSecurityState()
+    {
+        this.handshake = null;
+
+        Session? current = this.session;
+        this.session = null;
+        current?.Dispose();
     }
 
     // 设置连接处理器
@@ -210,6 +384,19 @@ public class Client
     {
         try
         {
+            if (this.securityOptions != null)
+            {
+                Session? current = this.session;
+
+                if (current == null)
+                {
+                    Console.WriteLine("The security session is not established");
+                    return false;
+                }
+
+                data = current.SealMessage(data, Direction.ClientToServer, route, seq ?? 0);
+            }
+
             byte[] buffer = this.Packer.PackMessage(route, seq, data);
             return this.Network.Send(buffer);
         }
@@ -226,6 +413,22 @@ public class Client
     {
         try
         {
+            if (this.securityOptions != null)
+            {
+                Session? current = this.session;
+
+                if (current == null)
+                {
+                    Console.WriteLine("The security session is not established");
+                    return false;
+                }
+
+                byte[]? payload = this.Packer.Encode(data);
+                payload = current.SealMessage(payload, Direction.ClientToServer, route, seq ?? 0);
+
+                return this.Network.Send(this.Packer.PackMessage(route, seq, payload));
+            }
+
             byte[] buffer = this.Packer.PackMessage(route, seq, data);
             return this.Network.Send(buffer);
         }
@@ -246,6 +449,9 @@ public class Client
     // 断开连接
     public void Disconnect()
     {
+        this.StopHandshakeTimer();
+        this.ResetSecurityState();
+
         this.Network.Disconnect();
     }
 

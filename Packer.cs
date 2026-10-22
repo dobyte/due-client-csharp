@@ -17,6 +17,12 @@ public class Packer
     // 默认buffer数据位字节长度
     public const int DEFAULT_BUFFER_BYTES = 5000;
 
+    // header 位的心跳帧标记
+    public const int HEADER_HEARTBEAT = 1 << 7;
+
+    // header 位的握手帧标记
+    public const int HEADER_HANDSHAKE = 1 << 0;
+
     // 字节序；默认为big
     private ByteOrder byteOrder = ByteOrder.BigEndian;
     // 路由字节长度（字节）；默认为2字节，最大值为65535
@@ -64,9 +70,49 @@ public class Packer
 
         bb.WriteInt32(DEFAULT_HEADER_BYTES);
 
-        bb.WriteInt8(1 << 7);
+        bb.WriteInt8(HEADER_HEARTBEAT);
 
         return bb.ToArrayBuffer();
+    }
+
+    // 打包握手帧；握手帧不含路由与序列号，仅由 header 标记
+    public byte[] PackHandshake(byte[]? payload)
+    {
+        ByteBuffer bb = new ByteBuffer(this.byteOrder);
+        int length = payload?.Length ?? 0;
+
+        bb.WriteInt32(DEFAULT_HEADER_BYTES + length);
+
+        bb.WriteInt8(HEADER_HANDSHAKE);
+
+        if (length > 0)
+        {
+            bb.WriteBytes(payload!);
+        }
+
+        return bb.ToArrayBuffer();
+    }
+
+    // 编码消息体
+    public byte[]? Encode(object? data)
+    {
+        if (data == null)
+        {
+            return null;
+        }
+
+        if (data is byte[] v)
+        {
+            return v;
+        }
+
+        return this.encoding.Encode(data);
+    }
+
+    // 解码消息体
+    public Data Decode(byte[] payload)
+    {
+        return this.encoding.Decode(payload);
     }
 
     // 打包消息
@@ -131,6 +177,24 @@ public class Packer
     // 解包消息
     public Packet Unpack(byte[] buff)
     {
+        Frame frame = this.UnpackFrame(buff);
+
+        if (frame.IsHeartbeat)
+        {
+            return new Packet(true, frame.Millisecond, null);
+        }
+
+        if (frame.IsHandshake)
+        {
+            throw new Exception("Handshake frame cannot be unpacked as a message");
+        }
+
+        return new Packet(false, null, new Message(frame.Seq, frame.Route, this.encoding.Decode(frame.Payload!)));
+    }
+
+    // 解包原始帧；握手帧与心跳帧不包含路由与序列号
+    public Frame UnpackFrame(byte[] buff)
+    {
         ByteBuffer bb = new(this.byteOrder, buff);
 
         Int32 size = bb.ReadInt32();
@@ -141,18 +205,22 @@ public class Packer
         }
 
         int header = bb.ReadInt8();
-        bool isHeartbeat = header >> 7 == 1;
 
-        if (isHeartbeat)
+        if ((header & HEADER_HEARTBEAT) == HEADER_HEARTBEAT)
         {
             if (bb.Remaining() > 0)
             {
-                return new Packet(isHeartbeat, bb.ReadInt64(), null);
+                return new Frame(true, bb.ReadInt64(), false, 0, 0, null);
             }
             else
             {
-                return new Packet(isHeartbeat, null, null);
+                return new Frame(true, null, false, 0, 0, null);
             }
+        }
+
+        if ((header & HEADER_HANDSHAKE) == HEADER_HANDSHAKE)
+        {
+            return new Frame(false, null, true, 0, 0, bb.ReadBytes((Int32)bb.Remaining()));
         }
 
         Int32 route = 0;
@@ -188,9 +256,9 @@ public class Packer
                 throw new Exception($"Unsupported seqBytes: {this.seqBytes}");
         }
 
-        byte[] data = bb.ReadBytes((Int32)(bb.Remaining()));
+        byte[] payload = bb.ReadBytes((Int32)(bb.Remaining()));
 
-        return new Packet(false, null, new Message(seq, route, this.encoding.Decode(data)));
+        return new Frame(false, null, false, route, seq, payload);
     }
 
     // 解包大小
@@ -200,6 +268,22 @@ public class Packer
 
         return bb.ReadInt32();
     }
+}
+
+public struct Frame(bool isHeartbeat, Int64? millisecond, bool isHandshake, Int32 route, Int32 seq, byte[]? payload)
+{
+    // 是否是心跳帧
+    public bool IsHeartbeat = isHeartbeat;
+    // 心跳帧携带的服务器时间（毫秒）
+    public Int64? Millisecond = millisecond;
+    // 是否是握手帧
+    public bool IsHandshake = isHandshake;
+    // 消息路由
+    public Int32 Route = route;
+    // 消息序列号
+    public Int32 Seq = seq;
+    // 消息载荷（握手帧为握手数据）
+    public byte[]? Payload = payload;
 }
 
 public struct Packet(bool isHeartbeat, Int64? millisecond, Message? message)
